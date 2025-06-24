@@ -1,0 +1,213 @@
+name: Deploy to Production
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+env:
+  APP_DIR: /opt/workflow-app
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup SSH
+      uses: webfactory/ssh-agent@v0.8.0
+      with:
+        ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+    - name: Add server to known hosts
+      run: |
+        mkdir -p ~/.ssh
+        ssh-keyscan -H ${{ secrets.HOST }} >> ~/.ssh/known_hosts
+
+    - name: Create deployment package
+      run: |
+        tar -czf deployment.tar.gz \
+          docker-compose.yml \
+          nginx.conf \
+          spring-service/ \
+          new-service/ \
+          scripts/ \
+          .env.example
+
+    - name: Upload deployment package
+      run: |
+        scp deployment.tar.gz ${{ secrets.USERNAME }}@${{ secrets.HOST }}:/tmp/
+
+    - name: Deploy to server
+      run: |
+        ssh ${{ secrets.USERNAME }}@${{ secrets.HOST }} << 'EOF'
+          set -e
+          
+          echo "🚀 Starting deployment process..."
+          
+          cd ${{ env.APP_DIR }} || exit 1
+          
+          tar -xzf /tmp/deployment.tar.gz
+          
+          if [ ! -f .env ]; then
+            if [ -f .env.production ]; then
+              cp .env.production .env
+            else
+              echo "❌ No environment file found. Please create .env from .env.example"
+              exit 1
+            fi
+          fi
+          
+          mkdir -p ./certs ./data/postgres ./data/redis ./data/kafka
+          chmod 755 ./certs ./data
+          
+          if docker-compose ps -q | grep -q .; then
+            echo "🛑 Stopping existing services..."
+            docker-compose down --timeout 30
+          fi
+          
+          echo "📦 Pulling latest Docker images..."
+          docker-compose pull
+          
+          echo "🔨 Building custom images..."
+          docker-compose build --no-cache --parallel
+          
+          echo "🚀 Starting services..."
+          docker-compose up -d
+          
+          echo "🧹 Cleaning up old images..."
+          docker image prune -f
+          
+          rm -f /tmp/deployment.tar.gz
+          
+          echo "✅ Deployment started successfully!"
+        EOF
+
+    - name: Wait for services to be ready
+      run: |
+        ssh ${{ secrets.USERNAME }}@${{ secrets.HOST }} << 'EOF'
+          echo "⏳ Waiting for services to be ready..."
+          
+          timeout=180
+          while [ $timeout -gt 0 ]; do
+            if docker-compose exec -T db pg_isready -U user -d dbname >/dev/null 2>&1; then
+              echo "✅ Database is ready"
+              break
+            fi
+            echo "⏳ Waiting for database..."
+            sleep 5
+            timeout=$((timeout-5))
+          done
+          
+          timeout=60
+          while [ $timeout -gt 0 ]; do
+            if docker-compose exec -T redis redis-cli ping >/dev/null 2>&1; then
+              echo "✅ Redis is ready"
+              break
+            fi
+            echo "⏳ Waiting for Redis..."
+            sleep 5
+            timeout=$((timeout-5))
+          done
+          
+          timeout=120
+          while [ $timeout -gt 0 ]; do
+            if docker-compose exec -T kafka kafka-topics.sh --bootstrap-server localhost:29092 --list >/dev/null 2>&1; then
+              echo "✅ Kafka is ready"
+              break
+            fi
+            echo "⏳ Waiting for Kafka..."
+            sleep 5
+            timeout=$((timeout-5))
+          done
+          
+          timeout=180
+          while [ $timeout -gt 0 ]; do
+            if curl -f http://localhost:2706/api/v1/workflows >/dev/null 2>&1; then
+              echo "✅ Spring Backend is ready"
+              break
+            fi
+            echo "⏳ Waiting for Spring Backend..."
+            sleep 10
+            timeout=$((timeout-10))
+          done
+          
+          timeout=60
+          while [ $timeout -gt 0 ]; do
+            if curl -f http://localhost:8000/health >/dev/null 2>&1; then
+              echo "✅ FastAPI Executor is ready"
+              break
+            fi
+            echo "⏳ Waiting for FastAPI Executor..."
+            sleep 5
+            timeout=$((timeout-5))
+          done
+        EOF
+
+    - name: Verify deployment
+      run: |
+        ssh ${{ secrets.USERNAME }}@${{ secrets.HOST }} << 'EOF'
+          echo "🔍 Verifying deployment..."
+          
+          echo "📊 Container Status:"
+          docker-compose ps
+          
+          if docker-compose ps | grep -q "unhealthy\|Exit"; then
+            echo "❌ Some services are not healthy"
+            echo "🔍 Checking logs for failed services..."
+            docker-compose logs --tail=50
+            exit 1
+          fi
+          
+          if [ -n "${{ secrets.DOMAIN }}" ]; then
+            echo "🌐 Testing external endpoints..."
+            
+            # Test backend through nginx
+            if curl -f -k https://${{ secrets.DOMAIN }}/api/v1/workflows >/dev/null 2>&1; then
+              echo "✅ Backend accessible through nginx"
+            else
+              echo "⚠️  Backend not accessible through nginx (may still be starting)"
+            fi
+            
+            # Test executor through nginx
+            if curl -f -k https://${{ secrets.DOMAIN }}/executor/health >/dev/null 2>&1; then
+              echo "✅ Executor accessible through nginx"
+            else
+              echo "⚠️  Executor not accessible through nginx (may still be starting)"
+            fi
+          fi
+          
+          echo "📈 System Resources:"
+          echo "Memory: $(free -h | awk 'NR==2{printf "%.1f%% used", $3/$2*100}')"
+          echo "Disk: $(df -h / | awk 'NR==2{print $5 " used"}')"
+          
+          echo "✅ Deployment verification completed!"
+        EOF
+
+    - name: Send deployment notification
+      if: always()
+      run: |
+        if [ ${{ job.status }} == 'success' ]; then
+          echo "✅ Deployment successful!"
+          echo "🌐 Services are now available at:"
+          echo "   - Backend API: https://${{ secrets.DOMAIN }}/api/"
+          echo "   - Node Executor: https://${{ secrets.DOMAIN }}/executor/"
+          echo "   - Kafka UI: https://${{ secrets.DOMAIN }}/kafka-ui/"
+          echo "   - Redis UI: https://${{ secrets.DOMAIN }}/redis-ui/"
+        else
+          echo "❌ Deployment failed!"
+          echo "Please check the logs above for details."
+        fi
+
+    - name: Cleanup on failure
+      if: failure()
+      run: |
+        ssh ${{ secrets.USERNAME }}@${{ secrets.HOST }} << 'EOF'
+          echo "🔄 Rolling back deployment..."
+          cd ${{ env.APP_DIR }}
+          docker-compose down
+          echo "💾 Deployment logs saved for debugging"
+          docker-compose logs > deployment-failure-$(date +%Y%m%d_%H%M%S).log
+        EOF
